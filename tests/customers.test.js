@@ -1,0 +1,103 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { addCustomer, addProduct, customerMetrics, dayOffset, editCustomer, emptyState, recordEntry, recordSale, refundSale, setCustomerArchived, today, validateState } from '../src/model.js';
+
+const contact = { name: 'Fatou Diallo', phone: '+221 77 123 45 67', email: 'fatou@example.com', address: 'Shop pickup', notes: 'Fragrance-free products' };
+const setup = () => addProduct(addCustomer(emptyState(), contact), { name: 'Glow Serum', sku: 'VD-001', category: 'Skincare', price: 750000, cost: 400000, quantity: 10, reorder: 3 });
+const sale = state => recordSale(state, { customerId: state.customers[0].id, lines: [{ productId: state.products[0].id, quantity: 2 }], discount: 50000, method: 'Cash' });
+
+test('customer profiles trim and normalize contacts, allowing different people with the same name', () => {
+  let state = addCustomer(emptyState(), { ...contact, name: ' Fatou Diallo ', email: ' FATOU@EXAMPLE.COM ' });
+  assert.equal(state.customers[0].name, 'Fatou Diallo');
+  assert.equal(state.customers[0].email, 'fatou@example.com');
+  assert.equal(state.customers[0].archived, false);
+  state = addCustomer(state, { name: contact.name, phone: '+221 78 765 43 21' });
+  assert.equal(state.customers.length, 2);
+  validateState(state);
+});
+test('duplicate contacts and invalid input do not replace existing customer data', () => {
+  const state = addCustomer(emptyState(), contact), before = JSON.stringify(state);
+  assert.throws(() => addCustomer(state, { name: 'Someone else', email: 'FATOU@example.com' }), /email already exists/);
+  assert.throws(() => addCustomer(state, { name: 'Someone else', phone: '+221771234567' }), /phone number already exists/);
+  assert.throws(() => addCustomer(state, { name: ' ' }), /name is required/);
+  assert.throws(() => addCustomer(state, { name: 'Test', phone: '123' }), /phone number/);
+  assert.throws(() => addCustomer(state, { name: 'Test', email: 'bad email' }), /email address/);
+  assert.equal(JSON.stringify(state), before);
+});
+test('editing a customer keeps sale ownership and original receipt name stable', () => {
+  let state = sale(setup());
+  const customerId = state.customers[0].id;
+  const saleId = state.transactions[0].id;
+  state = editCustomer(state, customerId, { ...contact, name: 'Fatou Sow', notes: 'Updated preference' });
+  assert.equal(state.customers[0].name, 'Fatou Sow');
+  assert.equal(state.transactions[0].party, 'Fatou Diallo');
+  assert.equal(state.transactions[0].customerId, customerId);
+  assert.equal(customerMetrics(state, customerId).netSpent, 1450000);
+  state = refundSale(state, saleId);
+  const summary = customerMetrics(state, customerId);
+  assert.equal(summary.sales, 1);
+  assert.equal(summary.refunded, 1450000);
+  assert.equal(summary.netSpent, 0);
+  assert.equal(summary.history.length, 2);
+  assert.equal(state.transactions[1].customerId, customerId);
+  validateState(state);
+});
+test('archived customers keep history and refunds, and cannot receive new sales until restored', () => {
+  let state = sale(setup());
+  const saleId = state.transactions[0].id, customerId = state.customers[0].id;
+  state = setCustomerArchived(state, customerId, true);
+  assert.equal(customerMetrics(state, customerId).sales, 1);
+  assert.throws(() => sale(state), /archived/);
+  state = refundSale(state, saleId);
+  assert.equal(customerMetrics(state, customerId).netSpent, 0);
+  state = setCustomerArchived(state, customerId, false);
+  state = sale(state);
+  assert.equal(customerMetrics(state, customerId).sales, 2);
+  validateState(state);
+});
+test('unknown customer IDs reject a sale atomically and walk-ins stay unlinked', () => {
+  const state = setup(), before = JSON.stringify(state);
+  assert.throws(() => recordSale(state, { customerId: 'missing', lines: [{ productId: state.products[0].id, quantity: 1 }], method: 'Cash' }), /existing customer/);
+  assert.equal(JSON.stringify(state), before);
+  const next = recordSale(state, { lines: [{ productId: state.products[0].id, quantity: 1 }], method: 'Cash' });
+  assert.equal(next.transactions[0].customerId, undefined);
+  assert.equal(customerMetrics(next, state.customers[0].id).sales, 0);
+});
+test('older backups migrate only named sales, retaining refunds and all financial records', () => {
+  let state = setup();
+  state = recordSale(state, { customer: 'Fatou Diallo', lines: [{ productId: state.products[0].id, quantity: 1 }], method: 'Cash' }, dayOffset(-3));
+  state = recordSale(state, { customer: 'fatou diallo', lines: [{ productId: state.products[0].id, quantity: 1 }], method: 'Cash' }, dayOffset(-1));
+  state = refundSale(state, state.transactions[0].id);
+  state = recordSale(state, { lines: [{ productId: state.products[0].id, quantity: 1 }], method: 'Cash' });
+  state = recordEntry(state, { type: 'expense', amount: 10000, description: 'Transport', party: 'Supplier', category: 'Transport', method: 'Cash', date: today() });
+  delete state.customers;
+  const snapshot = JSON.stringify(state);
+  const migrated = validateState(state);
+  assert.equal(JSON.stringify(state), snapshot, 'Original backup is not mutated');
+  assert.equal(migrated.customers.length, 1);
+  assert.equal(migrated.customers[0].createdAt, dayOffset(-3));
+  assert.equal(migrated.transactions[0].customerId, migrated.transactions[1].customerId);
+  assert.equal(migrated.transactions[2].customerId, migrated.transactions[0].customerId);
+  assert.equal(migrated.transactions[3].customerId, undefined);
+  assert.equal(migrated.transactions[4].customerId, undefined);
+  assert.equal(customerMetrics(migrated, migrated.customers[0].id).netSpent, 750000);
+  assert.deepEqual(migrated.products, state.products);
+  assert.deepEqual(migrated.movements, state.movements);
+  assert.equal(validateState(migrated), migrated, 'Migration runs once');
+});
+test('customer backups reject missing profiles, mismatched refund ownership, and duplicate contacts', () => {
+  const state = sale(setup());
+  const missing = structuredClone(state); missing.customers = [];
+  assert.throws(() => validateState(missing), /profile is missing/);
+  const invalidList = structuredClone(state); invalidList.customers = null;
+  assert.throws(() => validateState(invalidList), /customer list/);
+  const duplicate = structuredClone(state); duplicate.customers.push({ ...duplicate.customers[0], id: 'another' });
+  assert.throws(() => validateState(duplicate), /already exists/);
+  let refunded = refundSale(state, state.transactions[0].id);
+  refunded = addCustomer(refunded, { name: 'Different customer' });
+  refunded.transactions[1].customerId = refunded.customers[1].id;
+  assert.throws(() => validateState(refunded), /Invalid sale refund/);
+  const noCustomerData = structuredClone(state); delete noCustomerData.customers;
+  assert.throws(() => validateState(noCustomerData), /profiles are missing/);
+  validateState(JSON.parse(JSON.stringify(state)));
+});
