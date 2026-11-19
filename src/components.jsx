@@ -42,7 +42,7 @@ export function Modal({ title, subtitle, children, onClose, wide = false, busy =
   return <div className="modal-backdrop" onMouseDown={e => { if (e.target === e.currentTarget && !busy) onClose(); }}><section ref={ref} className={`modal ${wide ? 'wide' : ''}`} role="dialog" aria-modal="true" aria-labelledby="modal-title"><header className="modal-header"><div><h2 id="modal-title">{title}</h2>{subtitle && <p>{subtitle}</p>}</div><button className="icon-button" onClick={onClose} disabled={busy} aria-label="Close dialog"><X size={20} /></button></header>{children}</section></div>;
 }
 export function TransactionIcon({ type }) {
-  const Icon = { sale: ShoppingBag, income: ArrowDownLeft, expense: ArrowUpRight, purchase: Package, refund: RotateCcw }[type];
+  const Icon = { sale: ShoppingBag, income: ArrowDownLeft, payment: ArrowDownLeft, expense: ArrowUpRight, purchase: Package, refund: RotateCcw }[type];
   return <span className={`transaction-icon ${type}`}><Icon size={17} strokeWidth={1.7} /></span>;
 }
 export function download(content, filename, type = 'text/csv;charset=utf-8') {

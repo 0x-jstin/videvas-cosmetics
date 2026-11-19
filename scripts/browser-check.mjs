@@ -61,7 +61,7 @@ try {
     if (response.exceptionDetails) throw new Error(JSON.stringify(response.exceptionDetails));
     return response.result.value;
   };
-  const waitFor = async expression => { for (let i = 0; i < 100; i++) { if (await evaluate(`Boolean(${expression})`)) return; await sleep(50); } throw new Error(`Timed out: ${expression}`); };
+  const waitFor = async expression => { for (let i = 0; i < 300; i++) { if (await evaluate(`Boolean(${expression})`)) return; await sleep(50); } throw new Error(`Timed out: ${expression}`); };
   const click = async (text, scope = 'document') => { await evaluate(`(() => { const b=[...${scope}.querySelectorAll('button')].find(b => b.textContent.trim()===${JSON.stringify(text)} || b.querySelector('span')?.textContent.trim()===${JSON.stringify(text)}); if(!b) throw new Error('Missing button: '+${JSON.stringify(text)}); b.click(); })()`); await sleep(100); };
   const fill = async (selector, value) => {
     await evaluate(`(() => { const el=document.querySelector(${JSON.stringify(selector)}); if(!el) throw new Error('Missing field: '+${JSON.stringify(selector)}); const proto=el.tagName==='SELECT'?HTMLSelectElement.prototype:el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype; Object.getOwnPropertyDescriptor(proto,'value').set.call(el,${JSON.stringify(String(value))}); el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); })()`);
@@ -286,14 +286,19 @@ try {
   await submit(); assert.equal((await state()).transactions[0].amount, 2250000);
   await click('Customers', "document.querySelector('nav')"); await click('Add customer', "document.querySelector('.heading-actions')");
   for (const [key, value] of Object.entries({ name: 'Test Customer', phone: '+221 77 123 45 67', email: 'test.customer@example.com', address: 'Shop pickup', notes: 'Prefers fragrance-free products' })) await fill(`[role=dialog] [name=${key}]`, value);
+  await evaluate("document.querySelector('[name=vip]').click()");
   await submit(); assert.equal((await state()).customers.length, 1);
+  assert.equal((await state()).customers[0].vip, true);
+  await click('VIP', "document.querySelector('.customers-card .tabs')");
+  assert.equal(await evaluate("document.querySelectorAll('.customer-table tbody tr').length"), 1);
   const customerId = (await state()).customers[0].id;
   await evaluate("document.querySelector('.customer-cell').click()"); await sleep(100);
   await click('Record sale', "document.querySelector('[role=dialog]')");
   assert.equal(await evaluate("document.querySelector('[name=customerId]').value"), customerId, 'Profile sales preselect the customer');
   await fill('[aria-label="Product 1"]', (await state()).products[0].id);
   await fill('[aria-label="Quantity 1"]', '3');
-  await fill('[role=dialog] .form-grid .field:nth-child(3) input', '500');
+  await fill('[role=dialog] [name=discount]', '500');
+  await fill('[role=dialog] [name=paymentAmount]', '22000');
   await submit();
   let saved = await state(); validateState(saved);
   assert.equal(saved.products[0].batches[0].quantity, 7); assert.equal(saved.transactions.at(-1).amount, 2200000); assert.equal(metrics(saved).grossProfit, 1000000);
@@ -303,10 +308,11 @@ try {
   await fill('[role=dialog] [name=description]', 'Shopping bags'); await fill('[role=dialog] [name=amount]', '1000'); await fill('[role=dialog] [name=category]', 'Supplies');
   await submit(); saved = await state(); assert.equal(metrics(saved).operatingProfit, 900000); assert.equal(metrics(saved).cashFlow, -150000);
   await send('Page.reload'); await waitFor("document.querySelector('h1')?.textContent==='Business, in bloom.'");
-  saved = await state(); assert.equal(saved.transactions.length, 3); validateState(saved);
+  saved = await state(); assert.equal(saved.transactions.length, 4); validateState(saved);
+  assert.equal(customerMetrics(saved, customerId).balance, 0);
   assert.equal(saved.customers[0].notes, 'Prefers fragrance-free products');
   await click('Customers', "document.querySelector('nav')"); await evaluate("document.querySelector('.customer-cell').click()"); await sleep(100);
-  assert.equal(await evaluate("document.querySelectorAll('.customer-detail .transaction-table tbody tr').length"), 1);
+  assert.equal(await evaluate("document.querySelectorAll('.customer-detail .transaction-table tbody tr').length"), 2);
   await click('Edit customer'); await fill('[role=dialog] [name=name]', 'Updated Customer'); await submit();
   saved = await state(); assert.equal(saved.customers[0].name, 'Updated Customer');
   assert.equal(saved.transactions.find(t => t.type === 'sale').party, 'Test Customer', 'Historical receipt name is preserved');
@@ -319,15 +325,15 @@ try {
   await click('Restore customer'); await click('Restore customer', "document.querySelector('.modal-footer')");
   assert.equal((await state()).customers[0].archived, false);
   await click('Sales', "document.querySelector('nav')"); await evaluate("document.querySelector('.transaction-cell').click()"); await sleep(150);
-  await click('Return & refund'); await click('Record return & refund');
+  await click('Return & refund'); await evaluate("document.querySelector('[role=dialog] input[type=checkbox]').click()"); await click('Record return & refund');
   saved = await state(); validateState(saved); assert.equal(saved.products[0].batches[0].quantity, 10); assert.equal(metrics(saved).revenue, 0);
   assert.equal(customerMetrics(saved, customerId).netSpent, 0);
-  assert.equal(customerMetrics(saved, customerId).history.length, 2);
+  assert.equal(customerMetrics(saved, customerId).history.length, 3);
   await click('Customers', "document.querySelector('nav')"); await click('Export'); await sleep(350);
   const customerCSV = await readFile(`data/browser/downloads/videvas-customers-${today()}.csv`, 'utf8');
   assert.ok(customerCSV.includes('Updated Customer') && customerCSV.includes('test.customer@example.com') && customerCSV.includes('"XOF"'));
   await evaluate("document.querySelector('.customer-cell').click()"); await sleep(100);
-  assert.equal(await evaluate("document.querySelectorAll('.customer-detail .transaction-table tbody tr').length"), 2);
+  assert.equal(await evaluate("document.querySelectorAll('.customer-detail .transaction-table tbody tr').length"), 3);
   await evaluate("document.querySelector('.customer-detail .transaction-cell').click()"); await sleep(100); await click('View customer profile');
   assert.ok(await evaluate("document.querySelector('.customer-detail-hero h3').textContent==='Updated Customer'"));
   await evaluate("document.querySelector('[aria-label=\"Close dialog\"]').click()");
@@ -340,6 +346,8 @@ try {
   const backupState = validateState(JSON.parse(await readFile(`data/browser/downloads/${downloaded}`, 'utf8')));
   assert.equal(backupState.customers[0].id, customerId, 'Downloaded backup includes the customer profile');
   assert.equal(backupState.customers[0].notes, 'Prefers fragrance-free products');
+  assert.equal(backupState.customers[0].vip, true);
+  assert.equal(backupState.transactions.filter(t => t.type === 'payment').length, 1);
   await writeFile('data/browser/restore-test.json', JSON.stringify(saved));
   await fill('[name=storeName]', 'Temporary name'); await evaluate("document.querySelector('.settings-form').requestSubmit()"); await sleep(100);
   await send('DOM.enable');
@@ -365,10 +373,65 @@ try {
   assert.equal((await state()).transactions.length, transactionsBeforeConflict, 'A conflicted sale is not rebased or posted');
   await evaluate(`document.querySelector('[aria-label="Close dialog"]').click()`);
 
+  // Several purchases share one tab. Collection retries never duplicate a payment.
+  await click('Customers', "document.querySelector('nav')");
+  for (let visit = 0; visit < 2; visit++) {
+    await evaluate("document.querySelector('.customer-cell').click()"); await sleep(100);
+    await click('Record sale', "document.querySelector('[role=dialog]')");
+    await fill('[aria-label="Product 1"]', saved.products[0].id);
+    await submit(); await waitFor("!document.querySelector('[role=dialog]')");
+  }
+  assert.equal(customerMetrics(await state(), customerId).balance, 1500000);
+  await click('Outstanding', "document.querySelector('.customers-card .tabs')");
+  assert.equal(await evaluate("document.querySelectorAll('.customer-table tbody tr').length"), 1);
+  await screenshot('customer-tabs-desktop');
+  await evaluate("document.querySelector('.customer-cell').click()"); await sleep(100);
+  await screenshot('customer-tab-profile-desktop');
+  assert.equal(await evaluate("getComputedStyle(document.querySelector('.customer-tab-table th:nth-child(4)')).display"), 'table-cell');
+  assert.equal(await evaluate("document.querySelector('.customer-balance').dataset.customerBalance"), '1500000');
+  await click('Record payment', "document.querySelector('[role=dialog]')");
+  assert.equal(await evaluate("document.querySelector('[name=customerId]').value"), customerId);
+  await fill('[name=amount]', '15001');
+  assert.equal(await evaluate("document.querySelector('[name=amount]').checkValidity()"), false);
+  await fill('[name=amount]', '6000');
+  await screenshot('customer-payment-desktop');
+  backend.dropNextReply(); await submit();
+  await waitFor("document.querySelector('[role=dialog] .cloud-notice')?.textContent.includes('Check previous save')");
+  await click('Check previous save', "document.querySelector('[role=dialog]')");
+  await waitFor("!document.querySelector('[role=dialog]')");
+  let tabState = await state(); validateState(tabState);
+  assert.equal(customerMetrics(tabState, customerId).balance, 900000);
+  assert.equal(tabState.transactions.filter(t => t.type === 'payment').length, 2);
+  assert.equal(tabState.transactions.at(-1).saleId, undefined);
+  // A return clears debt across the whole tab and does not pay cash while debt remains.
+  await click('Sales', "document.querySelector('nav')");
+  await evaluate("document.querySelector('.transaction-cell').click()"); await sleep(100);
+  await click('Return & refund');
+  assert.ok(await evaluate("document.querySelector('.tab-balance-summary').textContent.includes('Cash to refund0 CFA')"));
+  await evaluate("document.querySelector('[role=dialog] input[type=checkbox]').click()"); await submit();
+  await waitFor("!document.querySelector('[role=dialog]')");
+  tabState = await state();
+  assert.equal(customerMetrics(tabState, customerId).balance, 150000);
+  assert.equal(tabState.transactions.at(-1).cashAmount, 0);
+  await click('Customers', "document.querySelector('nav')");
+  await evaluate("document.querySelector('.customer-cell').click()"); await sleep(100);
+  await click('Record payment', "document.querySelector('[role=dialog]')"); await click('Clear full balance');
+  assert.equal(await evaluate("document.querySelector('[name=amount]').value"), '1500');
+  await submit(); await waitFor("!document.querySelector('[role=dialog]')");
+  tabState = await state(); validateState(tabState);
+  assert.equal(customerMetrics(tabState, customerId).balance, 0);
+  await evaluate("document.querySelector('.customer-cell').click()"); await sleep(100); await click('Edit customer');
+  await evaluate("document.querySelector('[name=vip]').click()"); await submit();
+  assert.equal((await state()).customers[0].vip, false);
+  await click('VIP', "document.querySelector('.customers-card .tabs')");
+  assert.equal(await evaluate("document.querySelectorAll('.customer-table tbody tr').length"), 0);
+
   // An older backup migrates named customers only after explicit import.
   await click('Settings', "document.querySelector('.sidebar-bottom')"); await click('Start fresh');
   await fill('[role=dialog] input', 'START FRESH'); await submit();
-  const legacy = structuredClone(saved); delete legacy.customers; legacy.transactions.forEach(transaction => { delete transaction.customerId; });
+  const legacy = structuredClone(saved); delete legacy.customers;
+  legacy.transactions = legacy.transactions.filter(t => t.type !== 'payment');
+  legacy.transactions.forEach(t => { delete t.customerId; delete t.onAccount; delete t.cashAmount; if (['sale','refund'].includes(t.type)) t.method = 'Cash'; });
   const legacyRaw = JSON.stringify(legacy);
   await evaluate(`localStorage.setItem('videvas-workspace-v1', ${JSON.stringify(legacyRaw)})`);
   await send('Page.reload'); await waitFor("document.querySelector('.stat-value')");
@@ -404,7 +467,16 @@ try {
   await click('Customers', "document.querySelector('nav')");
   await evaluate("document.querySelector('.customer-cell').click()"); await sleep(100); await screenshot('customer-profile-mobile');
   assert.equal(await evaluate("document.querySelector('.modal').scrollWidth <= document.querySelector('.modal').clientWidth"), true, 'Mobile profile has horizontal overflow');
-  await evaluate("document.querySelector('[aria-label=\"Close dialog\"]').click()");
+  await click('Record sale', "document.querySelector('[role=dialog]')");
+  await fill('[aria-label="Product 1"]', (await state()).products[0].id); await submit();
+  await waitFor("!document.querySelector('[role=dialog]')");
+  await evaluate("document.querySelector('.customer-cell').click()"); await sleep(100);
+  await screenshot('customer-tab-profile-mobile');
+  assert.equal(await evaluate("document.querySelector('.modal').scrollWidth <= document.querySelector('.modal').clientWidth"), true, 'Mobile tab profile fits');
+  await click('Record payment', "document.querySelector('[role=dialog]')"); await screenshot('customer-payment-mobile');
+  assert.equal(await evaluate("document.querySelector('.modal').scrollWidth <= document.querySelector('.modal').clientWidth"), true, 'Mobile payment form fits');
+  await click('Clear full balance'); await submit(); await waitFor("!document.querySelector('[role=dialog]')");
+  assert.equal(customerMetrics(await state(), (await state()).customers[0].id).balance, 0);
   await evaluate("document.querySelector('[aria-label=\"Open navigation\"]').click()"); await sleep(100);
   await click('Settings', "document.querySelector('.sidebar-bottom')"); await click('Start fresh');
   await fill('[role=dialog] input', 'START FRESH'); await submit();
@@ -414,6 +486,15 @@ try {
   await send('Page.reload'); await waitFor("document.querySelector('.stat-value')");
   assert.equal((await state()).products.length, 0, 'Clearing a deliberate demo remains empty after reload');
   assert.deepEqual(errors, []);
-  console.log('Browser checks passed: sign-in/signup/email confirmation/password recovery, private accounts, Realtime and focus sync, conflicts, offline drafts, lost acknowledgements, duplicate-submit protection, legacy imports, desktop/mobile, customers, stock, sales, refunds, ledger, backups, exports.');
+  console.log('Browser checks passed: sign-in/signup/email confirmation/password recovery, private accounts, Realtime and focus sync, conflicts, offline drafts, lost acknowledgements, duplicate-submit protection, legacy imports, desktop/mobile, customer tabs, partial and full payments, VIP flags, stock, sales, refunds, ledger, backups, exports.');
   console.log('Screenshots saved in data/browser/.');
+} catch (error) {
+  try {
+    const result = await send('Page.captureScreenshot', { format: 'png' });
+    await writeFile('data/browser/failure.png', Buffer.from(result.data, 'base64'));
+    const body = await send('Runtime.evaluate', { expression: 'document.body.innerText', returnByValue: true });
+    console.error('Browser page:', body.result.value);
+    console.error('Browser errors:', errors);
+  } catch {}
+  throw error;
 } finally { child.kill(); server.closeAllConnections(); await new Promise(r => server.close(r)); await backend.close(); }

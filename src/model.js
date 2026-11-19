@@ -1,6 +1,10 @@
 export const STORAGE_KEY = 'videvas-workspace-v1';
 export const CATEGORIES = ['Skincare', 'Cosmetics', 'Bodycare'];
 export const METHODS = ['Cash', 'Card', 'Bank transfer', 'Mobile money'];
+export const TAB_METHOD = 'Customer tab';
+export const cashAmount = t => t.type === 'sale' && t.onAccount ? 0 : t.type === 'refund' && t.onAccount ? t.cashAmount : t.amount;
+export const isCashIncoming = t => ['sale', 'income', 'payment'].includes(t.type);
+export const tabChange = t => t.type === 'sale' && t.onAccount ? t.amount : t.type === 'payment' ? -t.amount : t.type === 'refund' && t.onAccount ? -(t.amount - t.cashAmount) : 0;
 export const EXPENSE_CATEGORIES = ['Rent', 'Utilities', 'Marketing', 'Transport', 'Supplies', 'Other'];
 export const id = () => crypto.randomUUID();
 export const today = () => {
@@ -53,6 +57,8 @@ function customerFields(input) {
   requireValue(!fields.phone || (/^\+?[\d\s().-]+$/.test(fields.phone) && phoneKey(fields.phone).length >= 7 && phoneKey(fields.phone).length <= 15), 'Enter a valid phone number with 7 to 15 digits.');
   requireValue(!fields.email || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(fields.email), 'Enter a valid email address.');
   fields.email = fields.email.toLowerCase();
+  requireValue(input.vip === undefined || typeof input.vip === 'boolean', 'Choose a valid VIP status.');
+  if (input.vip !== undefined) fields.vip = input.vip;
   return fields;
 }
 function uniqueContact(fields, customers, existingId) {
@@ -63,7 +69,7 @@ export function addCustomer(state, input) {
   const fields = customerFields(input);
   uniqueContact(fields, state.customers);
   const next = structuredClone(state);
-  next.customers.push({ id: id(), ...fields, archived: false, createdAt: today(), updatedAt: today() });
+  next.customers.push({ id: id(), vip: false, ...fields, archived: false, createdAt: today(), updatedAt: today() });
   return next;
 }
 export function editCustomer(state, customerId, input) {
@@ -85,12 +91,15 @@ export function setCustomerArchived(state, customerId, archived) {
   return next;
 }
 export function customerMetrics(state, customerId) {
-  const history = state.transactions.filter(t => t.customerId === customerId && ['sale', 'refund'].includes(t.type));
+  const history = state.transactions.filter(t => t.customerId === customerId && ['sale', 'refund', 'payment'].includes(t.type));
   const sales = history.filter(t => t.type === 'sale');
-  const paid = sales.reduce((sum, t) => sum + t.amount, 0);
+  const spent = sales.reduce((sum, t) => sum + t.amount, 0);
+  const paid = history.filter(t => t.type === 'sale' || t.type === 'payment').reduce((sum, t) => sum + cashAmount(t), 0);
   const refunded = history.filter(t => t.type === 'refund').reduce((sum, t) => sum + t.amount, 0);
+  const cashRefunded = history.filter(t => t.type === 'refund').reduce((sum, t) => sum + cashAmount(t), 0);
+  const balance = history.reduce((sum, t) => sum + tabChange(t), 0);
   const lastPurchase = sales.reduce((date, t) => t.date > date ? t.date : date, '');
-  return { sales: sales.length, paid, refunded, netSpent: paid - refunded, lastPurchase, history };
+  return { sales: sales.length, paid, refunded, cashRefunded, balance, netSpent: spent - refunded, lastPurchase, history };
 }
 // Existing workspaces and older backups stored customer names directly on sales.
 // Bring those named customers forward while leaving the original entries intact.
@@ -185,10 +194,14 @@ function reference(state, prefix) { return `${prefix}-${String(state.transaction
 export function recordSale(state, input, date = today()) {
   requireValue(validDate(date) && date <= today(), 'Sale date must be today or earlier.');
   requireValue(input.lines?.length, 'Add at least one product to the sale.');
-  requireValue(METHODS.includes(input.method), 'Choose a payment method.');
   const customer = input.customerId ? state.customers.find(c => c.id === input.customerId) : null;
   requireValue(!input.customerId || customer, 'Choose an existing customer.');
   requireValue(!customer?.archived, 'This customer is archived. Restore their profile before recording a new sale.');
+  requireValue(input.onAccount === undefined || typeof input.onAccount === 'boolean', 'Choose a valid sale payment option.');
+  const onAccount = input.onAccount === true;
+  requireValue(!onAccount || customer, 'Choose a customer for a sale on their tab.');
+  requireValue(onAccount || METHODS.includes(input.method), 'Choose a payment method.');
+  requireValue(input.paymentAmount === undefined || (onAccount && integer(input.paymentAmount)), 'Check the payment received.');
   const next = structuredClone(state);
   const unique = new Set();
   const lines = input.lines.map(line => {
@@ -226,17 +239,35 @@ export function recordSale(state, input, date = today()) {
   shares.sort((a, b) => a.fraction === b.fraction ? a.index - b.index : a.fraction > b.fraction ? -1 : 1).forEach(s => { lines[s.index].netAmount = (s.floor + (remainder-- > 0 ? 1 : 0)) * unit; });
   const cost = lines.reduce((sum, line) => sum + line.cost, 0);
   requireValue(integer(cost), 'Total product cost is too large.');
-  const transaction = { id: id(), reference: reference(next, 'SAL'), type: 'sale', date, amount, subtotal, discount, cost, method: input.method, category: 'Product sale', description: lines.length === 1 ? lines[0].name : `${lines.length} products`, party: customer?.name || input.customer?.trim() || 'Walk-in customer', note: input.note?.trim() || '', lines, ...(customer ? { customerId: customer.id } : {}) };
+  const transaction = { id: id(), reference: reference(next, 'SAL'), type: 'sale', date, amount, subtotal, discount, cost, method: onAccount ? TAB_METHOD : input.method, category: 'Product sale', description: lines.length === 1 ? lines[0].name : `${lines.length} products`, party: customer?.name || input.customer?.trim() || 'Walk-in customer', note: input.note?.trim() || '', lines, ...(customer ? { customerId: customer.id } : {}), ...(onAccount ? { onAccount: true } : {}) };
   next.transactions.push(transaction);
   lines.forEach(line => line.allocations.forEach(a => next.movements.push({ id: id(), productId: line.productId, batchId: a.batchId, transactionId: transaction.id, date, quantity: -a.quantity, type: 'Sale', reason: transaction.reference })));
+  return input.paymentAmount ? recordCustomerPayment(next, { customerId: customer.id, amount: input.paymentAmount, method: input.method, date, note: input.note }) : next;
+}
+export function recordCustomerPayment(state, input) {
+  const customer = state.customers.find(c => c.id === input.customerId);
+  requireValue(customer, 'Choose an existing customer.');
+  requireValue(integer(input.amount, 1), 'Payment must be greater than zero.');
+  currencyAmount(input.amount, state);
+  requireValue(input.amount <= customerMetrics(state, customer.id).balance, 'Payment cannot exceed the customer’s outstanding balance.');
+  requireValue(METHODS.includes(input.method), 'Choose a payment method.');
+  requireValue(validDate(input.date) && input.date <= today(), 'Payment date must be today or earlier.');
+  const next = structuredClone(state);
+  next.transactions.push({ id: id(), reference: reference(next, 'PAY'), type: 'payment', date: input.date, amount: input.amount, method: input.method, customerId: customer.id, party: customer.name, category: 'Customer payment', description: 'Payment towards customer tab', note: input.note?.trim() || '' });
   return next;
 }
-export function refundSale(state, saleId) {
+export function refundCashAmount(state, sale) {
+  return sale.onAccount ? Math.max(0, sale.amount - customerMetrics(state, sale.customerId).balance) : sale.amount;
+}
+export function refundSale(state, saleId, input = {}) {
   const next = structuredClone(state);
   const sale = next.transactions.find(t => t.id === saleId && t.type === 'sale');
   requireValue(sale, 'Sale was not found.');
   requireValue(!next.transactions.some(t => t.saleId === saleId), 'This sale has already been refunded.');
-  const transaction = { id: id(), reference: reference(next, 'REF'), type: 'refund', date: today(), amount: sale.amount, cost: sale.cost, saleId, method: sale.method, category: 'Sale refund', description: `Refund of ${sale.reference}`, party: sale.party, lines: sale.lines, ...(sale.customerId ? { customerId: sale.customerId } : {}) };
+  const cashRefund = refundCashAmount(state, sale);
+  const method = sale.onAccount ? (cashRefund ? input.method : TAB_METHOD) : sale.method;
+  requireValue(!cashRefund || METHODS.includes(method), 'Choose the payment method used for the cash refund.');
+  const transaction = { id: id(), reference: reference(next, 'REF'), type: 'refund', date: today(), amount: sale.amount, cost: sale.cost, saleId, method, category: 'Sale refund', description: `Refund of ${sale.reference}`, party: sale.party, lines: sale.lines, ...(sale.customerId ? { customerId: sale.customerId } : {}), ...(sale.onAccount ? { onAccount: true, cashAmount: cashRefund } : {}) };
   for (const line of sale.lines) {
     const product = next.products.find(p => p.id === line.productId);
     for (const allocation of line.allocations) {
@@ -267,9 +298,10 @@ export function metrics(state, transactions = state.transactions) {
   const revenue = sum('sale') - sum('refund');
   const cogs = sum('sale', 'cost') - sum('refund', 'cost');
   const expenses = sum('expense');
-  const incoming = sum('sale') + sum('income');
-  const outgoing = sum('expense') + sum('purchase') + sum('refund');
-  return { revenue, cogs, grossProfit: revenue - cogs, expenses, purchases: sum('purchase'), incoming, outgoing, cashFlow: incoming - outgoing, operatingProfit: revenue - cogs - expenses, units: state.products.reduce((s, p) => s + stock(p), 0), inventoryValue: state.products.reduce((s, p) => s + stockValue(p), 0) };
+  const incoming = transactions.filter(isCashIncoming).reduce((s, t) => s + cashAmount(t), 0);
+  const outgoing = transactions.filter(t => !isCashIncoming(t)).reduce((s, t) => s + cashAmount(t), 0);
+  const outstanding = state.transactions.reduce((s, t) => s + tabChange(t), 0);
+  return { revenue, cogs, grossProfit: revenue - cogs, expenses, purchases: sum('purchase'), incoming, outgoing, outstanding, cashFlow: incoming - outgoing, operatingProfit: revenue - cogs - expenses, units: state.products.reduce((s, p) => s + stock(p), 0), inventoryValue: state.products.reduce((s, p) => s + stockValue(p), 0) };
 }
 export function createDemo() {
   let state = emptyState();
@@ -337,9 +369,17 @@ export function validateState(state) {
     }
   }
   for (const t of state.transactions) {
-    requireValue(typeof t.id === 'string' && !transactionIds.has(t.id) && ['sale', 'refund', 'expense', 'income', 'purchase'].includes(t.type) && integer(t.amount, 1) && validDate(t.date) && METHODS.includes(t.method) && typeof t.description === 'string' && typeof t.reference === 'string' && typeof t.party === 'string' && typeof t.category === 'string', 'Invalid transaction in backup.');
+    requireValue(typeof t.id === 'string' && !transactionIds.has(t.id) && ['sale', 'refund', 'expense', 'income', 'purchase', 'payment'].includes(t.type) && integer(t.amount, 1) && validDate(t.date) && (METHODS.includes(t.method) || (t.onAccount === true && ['sale', 'refund'].includes(t.type) && t.method === TAB_METHOD)) && typeof t.description === 'string' && typeof t.reference === 'string' && typeof t.party === 'string' && typeof t.category === 'string', 'Invalid transaction in backup.');
     transactionIds.add(t.id);
-    if (t.customerId !== undefined) requireValue(typeof t.customerId === 'string' && customerIds.has(t.customerId) && ['sale', 'refund'].includes(t.type), 'Transaction customer profile is missing or invalid.');
+    if (t.customerId !== undefined) requireValue(typeof t.customerId === 'string' && customerIds.has(t.customerId) && ['sale', 'refund', 'payment'].includes(t.type), 'Transaction customer profile is missing or invalid.');
+    requireValue(t.onAccount === undefined || (typeof t.onAccount === 'boolean' && ['sale', 'refund'].includes(t.type)), 'Invalid customer tab entry.');
+    if (t.onAccount || t.type === 'payment') requireValue(customerIds.has(t.customerId), 'Customer tab profile is missing.');
+    if (t.type === 'payment') requireValue(t.saleId === undefined && t.lines === undefined, 'Payments must belong to a customer tab, without a sale link.');
+    if (t.onAccount && t.type === 'sale') requireValue(t.method === TAB_METHOD, 'Invalid customer tab sale.');
+    if (t.onAccount && t.type === 'refund') {
+      requireValue(integer(t.cashAmount) && t.cashAmount <= t.amount && (t.cashAmount ? METHODS.includes(t.method) : t.method === TAB_METHOD), 'Invalid customer tab refund.');
+      currencyAmount(t.cashAmount, state);
+    } else requireValue(t.cashAmount === undefined, 'Unexpected cash amount in transaction.');
     currencyAmount(t.amount, state);
     if (['sale', 'refund', 'purchase'].includes(t.type)) {
       requireValue(Array.isArray(t.lines) && t.lines.length > 0, 'Transaction lines are missing.');
@@ -361,10 +401,19 @@ export function validateState(state) {
     }
   }
   const refunds = new Set();
-  for (const t of state.transactions.filter(t => t.type === 'refund')) {
-    const original = state.transactions.find(s => s.id === t.saleId && s.type === 'sale');
-    requireValue(original && !refunds.has(t.saleId) && original.amount === t.amount && original.cost === t.cost && original.customerId === t.customerId && JSON.stringify(original.lines) === JSON.stringify(t.lines), 'Invalid sale refund.');
-    refunds.add(t.saleId);
+  const tabBalances = new Map(), postedSales = new Map();
+  for (const t of state.transactions) {
+    const balance = tabBalances.get(t.customerId) || 0;
+    if (t.type === 'sale') postedSales.set(t.id, t);
+    if (t.type === 'refund') {
+      const original = postedSales.get(t.saleId);
+      requireValue(original && !refunds.has(t.saleId) && original.amount === t.amount && original.cost === t.cost && original.customerId === t.customerId && Boolean(original.onAccount) === Boolean(t.onAccount) && JSON.stringify(original.lines) === JSON.stringify(t.lines), 'Invalid sale refund.');
+      if (t.onAccount) requireValue(t.cashAmount === Math.max(0, t.amount - balance), 'Customer tab refund does not match the outstanding balance.');
+      refunds.add(t.saleId);
+    }
+    const nextBalance = balance + tabChange(t);
+    requireValue(Number.isSafeInteger(nextBalance) && nextBalance >= 0, 'Payment exceeds the customer’s outstanding balance.');
+    if (t.customerId) tabBalances.set(t.customerId, nextBalance);
   }
   const balances = new Map();
   const movementIds = new Set();

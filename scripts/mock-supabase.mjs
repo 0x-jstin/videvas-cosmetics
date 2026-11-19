@@ -24,6 +24,7 @@ export class MockSupabase {
       grant execute on function auth.uid() to anon, authenticated;
     `);
     await backend.db.exec(await readFile(new URL('../supabase/migrations/001_cloud_workspaces.sql', import.meta.url), 'utf8'));
+    await backend.db.exec(await readFile(new URL('../supabase/migrations/002_customer_tabs.sql', import.meta.url), 'utf8'));
     return backend;
   }
   serial(callback) {

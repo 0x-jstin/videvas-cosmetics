@@ -2,7 +2,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
-import { createDemo, emptyState, recordEntry, today } from '../src/model.js';
+import { addCustomer, addProduct, createDemo, customerMetrics, emptyState, recordCustomerPayment, recordEntry, recordSale, refundSale, today } from '../src/model.js';
 
 const alice = '11111111-1111-4111-8111-111111111111';
 const bob = '22222222-2222-4222-8222-222222222222';
@@ -22,6 +22,7 @@ before(async () => {
     insert into auth.users values ('${alice}'), ('${bob}');
   `);
   await db.exec(await readFile(new URL('../supabase/migrations/001_cloud_workspaces.sql', import.meta.url), 'utf8'));
+  await db.exec(await readFile(new URL('../supabase/migrations/002_customer_tabs.sql', import.meta.url), 'utf8'));
 });
 after(async () => { await db?.close(); });
 
@@ -129,5 +130,47 @@ test('imports only populate an empty workspace; explicit replacement permits res
 test('the migration is safe to apply again without losing existing shops', async () => {
   const prior = await asUser(alice, load);
   await db.exec(await readFile(new URL('../supabase/migrations/001_cloud_workspaces.sql', import.meta.url), 'utf8'));
+  await db.exec(await readFile(new URL('../supabase/migrations/002_customer_tabs.sql', import.meta.url), 'utf8'));
   assert.deepEqual(await asUser(alice, load), prior);
+});
+
+test('cloud tabs save atomically, preserve payment receipts, and reject fabricated balances', async () => {
+  await asUser(bob, async () => {
+    let current = await load();
+    let s = addProduct(addCustomer(emptyState(), { name: 'VIP buyer', vip: true }), { name: 'Serum', sku: 'S1', category: 'Skincare', price: 100000, cost: 30000, quantity: 10, reorder: 1 });
+    current = await save(s, current.revision, crypto.randomUUID(), 'replace');
+    const customerId = s.customers[0].id;
+    s = recordSale(s, { customerId, onAccount: true, lines: [{ productId: s.products[0].id, quantity: 2 }], paymentAmount: 50000, method: 'Cash' });
+    const requestId = crypto.randomUUID();
+    current = await save(s, current.revision, requestId);
+    assert.equal(customerMetrics(current.state, customerId).balance, 150000);
+    assert.deepEqual((await save(s, current.revision - 1, requestId)).state, s);
+    const corruptions = [
+      copy => { copy.transactions.at(-1).amount = 250000; },
+      copy => { copy.transactions.at(-1).saleId = copy.transactions[0].id; },
+      copy => { copy.transactions.at(-1).customerId = 'missing'; },
+      copy => { copy.customers[0].vip = 'yes'; },
+      copy => { copy.transactions[0].onAccount = 'true'; },
+      copy => { copy.transactions.at(-1).amount = 50101; },
+    ];
+    for (const corrupt of corruptions) {
+      const copy = structuredClone(s); corrupt(copy);
+      await assert.rejects(save(copy, current.revision, crypto.randomUUID(), 'replace'));
+      assert.equal((await load()).revision, current.revision);
+    }
+    const overpayment = structuredClone(s);
+    overpayment.transactions.push({ ...s.transactions.at(-1), id: crypto.randomUUID(), amount: 150100 });
+    await assert.rejects(save(overpayment, current.revision), /outstanding balance/);
+    s = recordCustomerPayment(s, { customerId, amount: 150000, method: 'Mobile money', date: today() });
+    current = await save(s, current.revision);
+    const altered = structuredClone(s); altered.transactions[1].note = 'Changed';
+    await assert.rejects(save(altered, current.revision), /cannot be changed/);
+    s = refundSale(s, s.transactions[0].id, { method: 'Cash' });
+    const badReturn = structuredClone(s); badReturn.transactions.at(-1).cashAmount = 100000;
+    await assert.rejects(save(badReturn, current.revision), /refund does not match/);
+    current = await save(s, current.revision);
+    assert.equal(customerMetrics(current.state, customerId).balance, 0);
+    assert.equal(current.state.transactions.at(-1).cashAmount, 200000);
+    await assert.rejects(save(s, current.revision - 1), { code: 'PT409' });
+  });
 });
