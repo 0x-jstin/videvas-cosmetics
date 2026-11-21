@@ -2,6 +2,7 @@ export const STORAGE_KEY = 'videvas-workspace-v1';
 export const CATEGORIES = ['Skincare', 'Cosmetics', 'Bodycare'];
 export const METHODS = ['Cash', 'Card', 'Bank transfer', 'Mobile money'];
 export const TAB_METHOD = 'Customer tab';
+export const RECORD_LABELS = { sale: 'sale', payment: 'payment', purchase: 'restock', refund: 'refund', expense: 'expense', income: 'income' };
 export const cashAmount = t => t.type === 'sale' && t.onAccount ? 0 : t.type === 'refund' && t.onAccount ? t.cashAmount : t.amount;
 export const isCashIncoming = t => ['sale', 'income', 'payment'].includes(t.type);
 export const tabChange = t => t.type === 'sale' && t.onAccount ? t.amount : t.type === 'payment' ? -t.amount : t.type === 'refund' && t.onAccount ? -(t.amount - t.cashAmount) : 0;
@@ -190,7 +191,14 @@ export function adjustStock(state, input) {
   next.movements.push({ id: id(), productId: product.id, batchId: batch.id, date: today(), quantity: input.quantity, type: 'Adjustment', reason: input.reason.trim() });
   return next;
 }
-function reference(state, prefix) { return `${prefix}-${String(state.transactions.length + 1).padStart(4, '0')}`; }
+function reference(state, prefix) {
+  // Deleting an earlier entry must not duplicate a surviving receipt number.
+  const latest = state.transactions.reduce((maximum, t) => {
+    const number = Number(t.reference.match(/-(\d+)$/)?.[1]);
+    return Number.isSafeInteger(number) ? Math.max(maximum, number) : maximum;
+  }, state.transactions.length);
+  return `${prefix}-${String(latest + 1).padStart(4, '0')}`;
+}
 export function recordSale(state, input, date = today()) {
   requireValue(validDate(date) && date <= today(), 'Sale date must be today or earlier.');
   requireValue(input.lines?.length, 'Add at least one product to the sale.');
@@ -258,6 +266,46 @@ export function recordCustomerPayment(state, input) {
 }
 export function refundCashAmount(state, sale) {
   return sale.onAccount ? Math.max(0, sale.amount - customerMetrics(state, sale.customerId).balance) : sale.amount;
+}
+export function deleteTransaction(state, transactionId) {
+  const next = structuredClone(validateState(state));
+  const transaction = next.transactions.find(t => t.id === transactionId);
+  requireValue(transaction, 'This entry no longer exists. Refresh your workspace.');
+  requireValue(Object.hasOwn(RECORD_LABELS, transaction.type), 'This entry cannot be deleted.');
+  requireValue(!next.transactions.some(t => t.saleId === transactionId), 'Delete this sale’s refund first, then delete the sale.');
+
+  const removedMovements = next.movements.filter(m => m.transactionId === transactionId);
+  next.transactions = next.transactions.filter(t => t.id !== transactionId);
+  next.movements = next.movements.filter(m => m.transactionId !== transactionId);
+  const changes = new Map();
+  for (const m of removedMovements) {
+    const change = changes.get(m.batchId) || { productId: m.productId, quantity: 0 };
+    change.quantity += m.quantity;
+    changes.set(m.batchId, change);
+  }
+  for (const [batchId, change] of changes) {
+    const batch = next.products.find(p => p.id === change.productId)?.batches.find(b => b.id === batchId);
+    requireValue(batch, 'The original stock batch is missing. Refresh your workspace.');
+    const quantity = batch.quantity - change.quantity;
+    requireValue(quantity >= 0, `This ${RECORD_LABELS[transaction.type]} cannot be deleted because its stock has been sold or removed. Delete the related sales or restore the stock first.`);
+    requireValue(integer(quantity), 'Deleting this entry would exceed the stock limit.');
+    batch.quantity = quantity;
+  }
+  if (transaction.type === 'purchase') {
+    const purchasedBatches = new Set(transaction.lines.map(l => l.batchId));
+    for (const product of next.products) {
+      product.batches = product.batches.filter(b => !purchasedBatches.has(b.id) || b.quantity > 0
+        || next.movements.some(m => m.batchId === b.id)
+        || next.transactions.some(t => t.lines?.some(l => l.batchId === b.id || l.allocations?.some(a => a.batchId === b.id))));
+    }
+  }
+  try { return validateState(next); }
+  catch (error) {
+    if (/Payment exceeds|Customer tab refund does not match/.test(error.message)) {
+      throw new Error('Later customer payments or refunds depend on this entry. Delete those dependent entries first.');
+    }
+    throw error;
+  }
 }
 export function refundSale(state, saleId, input = {}) {
   const next = structuredClone(state);

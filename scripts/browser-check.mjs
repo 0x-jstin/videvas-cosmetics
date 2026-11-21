@@ -3,7 +3,7 @@ import { createServer } from 'node:http';
 import { readFile, mkdir, writeFile, readdir, stat } from 'node:fs/promises';
 import { resolve, extname, join } from 'node:path';
 import assert from 'node:assert/strict';
-import { createDemo, validateState, metrics, customerMetrics, today, dayOffset, recordEntry } from '../src/model.js';
+import { addCustomer, addProduct, createDemo, deleteTransaction, emptyState, receiveStock, recordSale, stock, validateState, metrics, customerMetrics, today, dayOffset, recordEntry } from '../src/model.js';
 
 import { MockSupabase, mockBrowserScript } from './mock-supabase.mjs';
 
@@ -69,6 +69,158 @@ try {
   const submit = async () => { await evaluate("document.querySelector('[role=dialog] form').requestSubmit()"); await sleep(150); };
   const state = () => backend.workspace(owner.id).then(document => document.state);
   const recordEntryForBrowser = (state, description) => recordEntry(state, { type: 'income', description, amount: 10000, method: 'Cash', date: today() });
+  async function deletionScenarios() {
+    const original = await state();
+    const makeFixture = () => {
+      let current = addProduct(addCustomer(emptyState({ storeName: 'Delete feature test' }), { name: 'Deletion buyer' }), {
+        name: 'Deletion serum', sku: 'DELETE-1', category: 'Skincare', price: 200000, cost: 100000, quantity: 2, reorder: 1,
+      });
+      current = receiveStock(current, { productId: current.products[0].id, quantity: 4, cost: 120000, method: 'Cash', batchCode: 'DELETE-RESTOCK' });
+      current = recordSale(current, { lines: [{ productId: current.products[0].id, quantity: 3 }], method: 'Cash' });
+      return recordSale(current, { customerId: current.customers[0].id, onAccount: true, paymentAmount: 50000, lines: [{ productId: current.products[0].id, quantity: 1 }], method: 'Cash' });
+    };
+    const seed = async () => {
+      const fixture = makeFixture();
+      await backend.saveAs(owner.id, () => fixture, 'replace');
+      await send('Page.reload');
+      await waitFor("document.querySelector('.stat-value')");
+      await waitFor("document.querySelector('.workspace-card strong')?.textContent==='Delete feature test'");
+      await waitFor("!document.querySelector('.cloud-notice')");
+      return fixture;
+    };
+    const openDelete = async reference => {
+      await waitFor(`document.querySelector('[aria-label="Delete ${reference}"]')`);
+      await evaluate(`document.querySelector('[aria-label="Delete ${reference}"]').click()`);
+      await waitFor("document.querySelector('[role=dialog] h2')?.textContent.startsWith('Delete ')");
+      await sleep(200);
+    };
+    try {
+      const fixture = await seed();
+      const [restock, walkIn, tabSale, payment] = fixture.transactions;
+      await click('Sales', "document.querySelector('nav')");
+      await openDelete(walkIn.reference);
+      assert.ok((await evaluate("document.querySelector('.delete-record-summary').textContent")).includes('+3 units'));
+      const beforeCancel = backend.saveCalls.length;
+      await screenshot('delete-sale-desktop');
+      await click('Cancel', "document.querySelector('[role=dialog]')");
+      assert.equal(backend.saveCalls.length, beforeCancel);
+      assert.deepEqual(await state(), fixture, 'Cancel keeps every stock and financial record');
+
+      // Deleting twice while the first save is held sends only one operation.
+      await openDelete(walkIn.reference);
+      const hold = backend.holdNextSave(), beforeDelete = backend.saveCalls.length;
+      await evaluate("(() => { const form=document.querySelector('[role=dialog] form'); form.requestSubmit(); form.requestSubmit(); })()");
+      await hold.arrived;
+      assert.equal(backend.saveCalls.length, beforeDelete + 1);
+      assert.equal(backend.saveCalls.at(-1).p_mode, 'delete');
+      assert.equal(await evaluate("document.querySelector('[role=dialog] button[type=submit]').disabled"), true);
+      hold.release(); await waitFor("!document.querySelector('[role=dialog]')");
+      assert.equal((await state()).transactions.some(t => t.id === walkIn.id), false);
+      assert.equal(stock((await state()).products[0]), 5);
+
+      // Both stock dependencies and tab dependencies are visible before saving.
+      await click('Cash ledger', "document.querySelector('nav')"); await click('Purchases', "document.querySelector('.table-toolbar .tabs')");
+      await openDelete(restock.reference);
+      assert.match(await evaluate("document.querySelector('[role=dialog] .form-error').textContent"), /stock has been sold or removed/);
+      assert.equal(await evaluate("document.querySelector('[role=dialog] button[type=submit]').disabled"), true);
+      const blockedCalls = backend.saveCalls.length;
+      await submit(); assert.equal(backend.saveCalls.length, blockedCalls);
+      await click('Cancel', "document.querySelector('[role=dialog]')");
+      await click('Sales', "document.querySelector('nav')"); await openDelete(tabSale.reference);
+      assert.match(await evaluate("document.querySelector('[role=dialog] .form-error').textContent"), /dependent entries first/);
+      await screenshot('delete-sale-dependent-payment');
+      await click('Cancel', "document.querySelector('[role=dialog]')");
+
+      await click('Cash ledger', "document.querySelector('nav')"); await click('Payments', "document.querySelector('.table-toolbar .tabs')");
+      await evaluate(`document.querySelector('[aria-label="View ${payment.reference}"]').click()`);
+      await click('Delete payment', "document.querySelector('[role=dialog]')");
+      await screenshot('delete-payment-desktop');
+      assert.ok((await evaluate("document.querySelector('.delete-record-summary').textContent")).includes('2,000 CFA'));
+      await submit(); await waitFor("!document.querySelector('[role=dialog]')");
+      assert.equal(customerMetrics(await state(), fixture.customers[0].id).balance, 200000);
+      assert.equal((await state()).transactions.some(t => t.id === payment.id), false);
+      await click('Customers', "document.querySelector('nav')");
+      await evaluate("document.querySelector('.customer-cell').click()");
+      await waitFor("document.querySelector('[data-customer-balance=\"200000\"]')");
+      await evaluate("document.querySelector('.customer-tab-table .transaction-cell').click()");
+      await click('Delete sale', "document.querySelector('[role=dialog]')");
+      await submit(); await waitFor("!document.querySelector('[role=dialog]')");
+      assert.equal(customerMetrics(await state(), fixture.customers[0].id).balance, 0);
+      assert.equal(stock((await state()).products[0]), 6);
+
+      // A restock can also be opened from its product's received-stock history.
+      await click('Inventory', "document.querySelector('nav')");
+      await evaluate("document.querySelector('.inventory-table .product-cell').click()");
+      await click('View restock', "document.querySelector('[role=dialog]')");
+      await click('Delete restock', "document.querySelector('[role=dialog]')");
+      await screenshot('delete-restock-desktop');
+      assert.ok((await evaluate("document.querySelector('.delete-record-summary').textContent")).includes('-4 units'));
+      await submit(); await waitFor("!document.querySelector('[role=dialog]')");
+      let current = await state();
+      assert.equal(current.transactions.length, 0);
+      assert.equal(current.products[0].batches.length, 1);
+      assert.equal(stock(current.products[0]), 2);
+      assert.equal(current.movements.length, 1);
+      await send('Page.reload'); await waitFor("document.querySelector('.stat-value')");
+      assert.equal((await state()).transactions.length, 0, 'Deletions persist after reload');
+
+      const lost = await seed();
+      await click('Sales', "document.querySelector('nav')"); await openDelete(lost.transactions[1].reference);
+      const beforeLost = backend.saveCalls.length;
+      backend.dropNextReply(); await submit();
+      await waitFor("document.querySelector('[role=dialog] .cloud-notice')?.textContent.includes('Check previous save')");
+      assert.equal((await state()).transactions.some(t => t.id === lost.transactions[1].id), false);
+      await backend.saveAs(owner.id, s => recordEntryForBrowser(s, 'After lost deletion response'));
+      await click('Check previous save', "document.querySelector('[role=dialog]')");
+      await waitFor("!document.querySelector('[role=dialog]')");
+      assert.equal(backend.saveCalls.at(-1).p_request_id, backend.saveCalls[beforeLost].p_request_id);
+      assert.equal(backend.saveCalls.at(-1).p_mode, 'delete');
+      assert.equal(stock((await state()).products[0]), 5, 'A retry restores stock exactly once');
+      assert.equal((await state()).transactions.filter(t => t.description === 'After lost deletion response').length, 1);
+
+      const conflicting = await seed();
+      await openDelete(conflicting.transactions[1].reference);
+      backend.beforeNextSave = async () => backend.saveAs(owner.id, s => recordEntryForBrowser(s, 'Before stale deletion'));
+      await submit();
+      await waitFor("document.querySelector('[role=dialog] .form-error')?.textContent.includes('changed on another device')");
+      assert.equal((await state()).transactions.some(t => t.id === conflicting.transactions[1].id), true);
+      assert.equal(stock((await state()).products[0]), 2);
+      await submit(); await waitFor("!document.querySelector('[role=dialog]')");
+      assert.equal((await state()).transactions.some(t => t.description === 'Before stale deletion'), true);
+      assert.equal(stock((await state()).products[0]), 5);
+
+      const remoteDeleted = await seed();
+      await openDelete(remoteDeleted.transactions[1].reference);
+      await backend.saveAs(owner.id, s => deleteTransaction(s, remoteDeleted.transactions[1].id), 'delete');
+      await waitFor("document.querySelector('[role=dialog] .form-error')?.textContent.includes('no longer in your workspace')");
+      assert.equal(await evaluate("document.querySelector('[role=dialog] button[type=submit]').disabled"), true);
+      await click('Cancel', "document.querySelector('[role=dialog]')");
+
+      const mobile = await seed();
+      await send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+      await evaluate(`(() => { const entry=[...document.querySelectorAll('main .transaction-cell')].find(button => button.textContent.includes(${JSON.stringify(mobile.transactions[1].reference)})); if (!entry) throw new Error('Missing mobile sale'); entry.click(); })()`);
+      await click('Delete sale', "document.querySelector('[role=dialog]')");
+      await sleep(200);
+      await screenshot('delete-sale-mobile');
+      assert.equal(await evaluate("document.querySelector('.modal').scrollWidth <= document.querySelector('.modal').clientWidth"), true, 'Mobile delete confirmation fits');
+      const beforeOffline = backend.saveCalls.length;
+      await send('Network.enable');
+      await send('Network.emulateNetworkConditions', { offline: true, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+      await waitFor('navigator.onLine===false');
+      assert.equal(await evaluate("document.querySelector('[role=dialog] button[type=submit]').disabled"), true);
+      await submit(); assert.equal(backend.saveCalls.length, beforeOffline);
+      await send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+      await waitFor("!document.querySelector('.cloud-notice')");
+      await submit(); await waitFor("!document.querySelector('[role=dialog]')");
+      assert.equal(stock((await state()).products[0]), 5);
+      validateState(await state());
+    } finally {
+      await send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 1050, deviceScaleFactor: 1, mobile: false });
+      await backend.saveAs(owner.id, () => original, 'replace');
+      await waitFor(`document.querySelector('.workspace-card strong')?.textContent===${JSON.stringify(original.settings.storeName)}`);
+    }
+    console.log('Deletion checks passed: sale/payment/restock, cancel, dependency guards, stock and cash rollback, customer history, retries, stale saves, offline and mobile.');
+  }
   async function cloudScenarios() {
     const primarySession = sessionId;
     const targetIds = new Map();
@@ -99,6 +251,13 @@ try {
     await click('Overview', "document.querySelector('nav')");
     await waitFor("document.querySelector('.transaction-table')?.textContent.includes('Realtime contribution')");
     assert.equal((await state()).transactions.length, transactionCount + 1, 'Another device sees the same confirmed shop');
+    const syncedEntry = (await state()).transactions.find(t => t.description === 'Realtime contribution');
+    await backend.saveAs(owner.id, current => deleteTransaction(current, syncedEntry.id), 'delete');
+    await waitFor("!document.querySelector('.transaction-table')?.textContent.includes('Realtime contribution')");
+    sessionId = otherDevice;
+    await waitFor("!document.querySelector('.transaction-table')?.textContent.includes('Realtime contribution')");
+    assert.equal((await state()).transactions.length, transactionCount, 'Deletion syncs to both signed-in devices');
+    sessionId = primarySession;
     await evaluate('window.__videvasTestPauseRealtime = true');
     await backend.saveAs(owner.id, current => recordEntryForBrowser(current, 'Focus contribution'));
     await sleep(100);
@@ -445,6 +604,7 @@ try {
   assert.equal(await evaluate("localStorage.getItem('videvas-workspace-v1')"), legacyRaw);
   assert.equal(await evaluate("[...document.querySelectorAll('button')].find(button => button.textContent.trim()==='Import browser records').disabled"), true);
 
+  await deletionScenarios();
   await cloudScenarios();
   await click('Settings', "document.querySelector('.sidebar-bottom')"); await click('Start fresh');
   await fill('[role=dialog] input', 'START FRESH'); await submit();

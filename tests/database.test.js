@@ -2,7 +2,7 @@ import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { PGlite } from '@electric-sql/pglite';
-import { addCustomer, addProduct, createDemo, customerMetrics, emptyState, recordCustomerPayment, recordEntry, recordSale, refundSale, today } from '../src/model.js';
+import { addCustomer, addProduct, createDemo, customerMetrics, deleteTransaction, emptyState, metrics, receiveStock, recordCustomerPayment, recordEntry, recordSale, refundSale, today, validateState } from '../src/model.js';
 
 const alice = '11111111-1111-4111-8111-111111111111';
 const bob = '22222222-2222-4222-8222-222222222222';
@@ -23,6 +23,7 @@ before(async () => {
   `);
   await db.exec(await readFile(new URL('../supabase/migrations/001_cloud_workspaces.sql', import.meta.url), 'utf8'));
   await db.exec(await readFile(new URL('../supabase/migrations/002_customer_tabs.sql', import.meta.url), 'utf8'));
+  await db.exec(await readFile(new URL('../supabase/migrations/20261121102723_delete_shop_records.sql', import.meta.url), 'utf8'));
 });
 after(async () => { await db?.close(); });
 
@@ -131,6 +132,7 @@ test('the migration is safe to apply again without losing existing shops', async
   const prior = await asUser(alice, load);
   await db.exec(await readFile(new URL('../supabase/migrations/001_cloud_workspaces.sql', import.meta.url), 'utf8'));
   await db.exec(await readFile(new URL('../supabase/migrations/002_customer_tabs.sql', import.meta.url), 'utf8'));
+  await db.exec(await readFile(new URL('../supabase/migrations/20261121102723_delete_shop_records.sql', import.meta.url), 'utf8'));
   assert.deepEqual(await asUser(alice, load), prior);
 });
 
@@ -173,4 +175,137 @@ test('cloud tabs save atomically, preserve payment receipts, and reject fabricat
     assert.equal(current.state.transactions.at(-1).cashAmount, 200000);
     await assert.rejects(save(s, current.revision - 1), { code: 'PT409' });
   });
+});
+
+function deletionFixture() {
+  return addProduct(addCustomer(emptyState(), { name: 'Deletion test buyer' }), {
+    name: 'Serum', sku: 'DEL-1', category: 'Skincare', price: 200000, cost: 100000, quantity: 2, reorder: 1,
+  });
+}
+const deletionRestock = state => receiveStock(state, { productId: state.products[0].id, quantity: 4, cost: 120000, method: 'Cash' });
+const deletionSale = (state, onAccount = false) => recordSale(state, {
+  lines: [{ productId: state.products[0].id, quantity: 4 }], method: 'Cash',
+  ...(onAccount ? { customerId: state.customers[0].id, onAccount: true, paymentAmount: 200000 } : {}),
+});
+
+test('SQL deletion matches the financial model for sales, payments, restocks, refunds, and cash entries', async () => {
+  const received = deletionRestock(deletionFixture());
+  const sold = deletionSale(received);
+  const tab = deletionSale(received, true);
+  const returned = refundSale(sold, sold.transactions.at(-1).id);
+  const scenarios = [
+    [sold, sold.transactions.at(-1).id],
+    [tab, tab.transactions.at(-1).id],
+    [received, received.transactions[0].id],
+    [returned, returned.transactions.at(-1).id],
+    [recordEntry(received, { type: 'expense', description: 'Rent', amount: 10000, category: 'Rent', method: 'Cash', date: today() }), null],
+    [entry(received), null],
+    [returned, received.transactions[0].id],
+  ];
+  for (const [state, target] of scenarios) {
+    const transactionId = target || state.transactions.at(-1).id;
+    const expected = deleteTransaction(state, transactionId);
+    const computed = (await db.query('select public.videvas_state_after_delete($1::jsonb, $2::text) as state', [JSON.stringify(state), transactionId])).rows[0].state;
+    assert.deepEqual(computed, expected);
+    await asUser(alice, async () => {
+      let current = await load();
+      current = await save(state, current.revision, crypto.randomUUID(), 'replace');
+      const result = await save(expected, current.revision, crypto.randomUUID(), 'delete');
+      assert.deepEqual(result.state, expected);
+      assert.deepEqual(metrics(result.state), metrics(expected));
+      validateState(result.state);
+      assert.equal(result.revision, current.revision + 1);
+      assert.equal((await db.query('select * from public.videvas_transactions')).rows.length, expected.transactions.length);
+      assert.equal((await db.query('select * from public.videvas_stock_movements')).rows.length, expected.movements.length);
+      assert.equal((await db.query('select revision from public.videvas_workspace_changes')).rows[0].revision, result.revision);
+    });
+  }
+});
+
+test('delete mode rejects edits to other records, extra removals, additions, and incorrect stock rollback', async () => {
+  await asUser(alice, async () => {
+    let current = await load();
+    const posted = entry(deletionSale(deletionRestock(deletionFixture())));
+    current = await save(posted, current.revision, crypto.randomUUID(), 'replace');
+    current = await load();
+    const deleted = deleteTransaction(posted, posted.transactions[1].id);
+    await assert.rejects(save(deleted, current.revision), /cannot be changed/);
+    await assert.rejects(save(posted, current.revision, crypto.randomUUID(), 'delete'), /one existing record/);
+    const mutations = [
+      copy => { copy.products[0].price += 100; },
+      copy => { copy.products[0].batches[0].quantity += 1; },
+      copy => { copy.products[0].batches.pop(); },
+      copy => { copy.customers[0].name = 'Changed customer'; },
+      copy => { copy.settings.storeName = 'Changed shop'; },
+      copy => { copy.settings.currency = 'USD'; },
+      copy => { copy.transactions.at(-1).description = 'Changed entry'; },
+      copy => { copy.transactions.reverse(); },
+      copy => { copy.transactions.push(entry(emptyState()).transactions[0]); },
+      copy => { copy.transactions.pop(); },
+      copy => { copy.movements.pop(); },
+      copy => { copy.movements = structuredClone(posted.movements); },
+    ];
+    for (const mutate of mutations) {
+      const corrupt = structuredClone(deleted); mutate(corrupt);
+      await assert.rejects(save(corrupt, current.revision, crypto.randomUUID(), 'delete'), /Deletion must only|one existing record|invalid/);
+      assert.deepEqual(await load(), current, 'A rejected deletion cannot partially change the shop');
+    }
+    current = await save(deleted, current.revision, crypto.randomUUID(), 'delete');
+    assert.deepEqual(current.state, deleted);
+  });
+});
+
+test('SQL refuses deletion of consumed stock, a returned sale, and entries used by later payments or refunds', async () => {
+  const received = deletionRestock(deletionFixture());
+  const sold = deletionSale(received);
+  const returned = refundSale(sold, sold.transactions.at(-1).id);
+  const tab = deletionSale(received, true);
+  const tabReturn = refundSale(tab, tab.transactions[1].id, { method: 'Cash' });
+  const scenarios = [
+    [sold, received.transactions[0].id, /stock has been sold or removed/],
+    [returned, sold.transactions.at(-1).id, /refund first/],
+    [tab, tab.transactions[1].id, /dependent entries first/],
+    [tabReturn, tab.transactions[2].id, /dependent entries first/],
+  ];
+  for (const [state, target, reason] of scenarios) {
+    await assert.rejects(db.query('select public.videvas_state_after_delete($1::jsonb, $2::text)', [JSON.stringify(state), target]), reason);
+  }
+});
+
+test('deletion retries remain idempotent after another device saves and stale deletion requests cannot overwrite it', async () => {
+  await asUser(alice, async () => {
+    let current = await load();
+    const posted = deletionSale(deletionRestock(deletionFixture()));
+    current = await save(posted, current.revision, crypto.randomUUID(), 'replace');
+    const revision = current.revision, requestId = crypto.randomUUID();
+    const deleted = deleteTransaction(posted, posted.transactions.at(-1).id);
+    const committed = await save(deleted, revision, requestId, 'delete');
+    const newer = entry(deleted, 'Another device after deletion');
+    current = await save(newer, committed.revision);
+    current = await load();
+    const retry = await save(deleted, revision, requestId, 'delete');
+    assert.equal(retry.request_revision, committed.revision);
+    assert.equal(retry.revision, current.revision);
+    assert.deepEqual(retry.state, newer);
+    await assert.rejects(save(deleted, revision, crypto.randomUUID(), 'delete'), { code: 'PT409' });
+    await assert.rejects(save(deleted, revision, requestId, 'replace'), /different entry/);
+    assert.deepEqual(await load(), current);
+  });
+});
+
+test('the deletion helper is private and one owner cannot delete another owner’s records', async () => {
+  const before = await asUser(alice, load);
+  const foreign = deleteTransaction(before.state, before.state.transactions.at(-1).id);
+  await asUser(bob, async () => {
+    const own = await load();
+    await assert.rejects(save(foreign, own.revision, crypto.randomUUID(), 'delete'), /one existing record|Deletion must only|outstanding balance|Invalid/);
+    assert.deepEqual(await load(), own);
+    await assert.rejects(db.query('select public.videvas_state_after_delete($1::jsonb, $2::text)', [JSON.stringify(before.state), before.state.transactions.at(-1).id]), /permission denied/);
+    await assert.rejects(db.exec('delete from public.videvas_workspaces'), /permission denied/);
+  });
+  await asUser(null, async () => {
+    await assert.rejects(save(foreign, 0, crypto.randomUUID(), 'delete'), /permission denied/);
+    await assert.rejects(db.query('select public.videvas_state_after_delete($1::jsonb, $2::text)', [JSON.stringify(before.state), before.state.transactions.at(-1).id]), /permission denied/);
+  }, 'anon');
+  assert.deepEqual(await asUser(alice, load), before);
 });

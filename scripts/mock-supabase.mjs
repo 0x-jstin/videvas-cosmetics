@@ -25,6 +25,7 @@ export class MockSupabase {
     `);
     await backend.db.exec(await readFile(new URL('../supabase/migrations/001_cloud_workspaces.sql', import.meta.url), 'utf8'));
     await backend.db.exec(await readFile(new URL('../supabase/migrations/002_customer_tabs.sql', import.meta.url), 'utf8'));
+    await backend.db.exec(await readFile(new URL('../supabase/migrations/20261121102723_delete_shop_records.sql', import.meta.url), 'utf8'));
     return backend;
   }
   serial(callback) {

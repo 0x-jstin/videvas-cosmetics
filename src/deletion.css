@@ -1,0 +1,11 @@
+.transaction-row-actions{display:flex;justify-content:flex-end;align-items:center;gap:3px;min-width:65px}
+.delete-record-button{color:#a44e48}
+.delete-record-button:hover{color:#913f3a;background:#faefed}
+.delete-record-section{display:flex;align-items:flex-start;flex-direction:column;gap:11px;margin-top:25px;padding-top:20px;border-top:1px solid #e9ede8}
+.delete-record-section small{font-size:11px;line-height:1.7;color:#899180}
+.button.danger-outline{background:transparent;border:1px solid #dcb6b0;color:#a44e48}
+.button.danger-outline:hover{background:#faefed;border-color:#c99891}
+.delete-record-summary{margin-top:20px;margin-bottom:17px}
+.delete-record-summary dd{max-width:65%;overflow-wrap:anywhere}
+.delete-record-effect{font-size:12px;line-height:1.8}
+.movement-entry-link{margin-top:7px;font-size:11px}

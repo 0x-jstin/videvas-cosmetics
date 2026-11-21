@@ -187,7 +187,7 @@ export function createWorkspaceStore(transport, { isOnline = () => globalThis.na
       if (loading) throw new CloudError('Your records are syncing. Please wait a moment before saving.', 'SYNCING');
       if (snapshot.needsRefresh) throw new CloudError('Sync the latest records before saving again.', 'NEEDS_REFRESH');
       if (!isOnline()) throw new CloudError('You’re offline. Reconnect before saving. This entry has not been posted.', 'OFFLINE');
-      if (!['save', 'import', 'replace'].includes(mode)) throw new CloudError('Choose a valid save operation.', 'INVALID_MODE');
+      if (!['save', 'import', 'replace', 'delete'].includes(mode)) throw new CloudError('Choose a valid save operation.', 'INVALID_MODE');
       const next = validateState(transform(structuredClone(snapshot.state)));
       if (new TextEncoder().encode(JSON.stringify(next)).length > 20_000_000) throw new CloudError('Your workspace is larger than 20 MB. Export a backup before continuing.', 'TOO_LARGE');
       operation = { ownerId: snapshot.ownerId, captured: generation, requestId: crypto.randomUUID(), state: structuredClone(next), expectedRevision: snapshot.revision, mode };

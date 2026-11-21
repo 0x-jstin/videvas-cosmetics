@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import assert from 'node:assert/strict';
+import { emptyState } from '../src/model.js';
 
 const site = 'https://videvas-cosmetics-site.vercel.app';
 const raw = await readFile('.env.local', 'utf8');
@@ -69,6 +70,18 @@ try {
     return sources.some(source => source.includes(${JSON.stringify(publicKey)}) && source.includes('https://tmixrlodofdycichecyj.supabase.co'));
   })()`);
   assert.ok(sourceMatches, 'The live build must contain the intended Supabase project and public key');
+  const entry = await evaluate("document.querySelector('script[type=module][src]').src");
+  const entryResponse = await fetch(entry, { signal: AbortSignal.timeout(20000) });
+  assert.equal(entryResponse.status, 200, 'The production entry script must load');
+  const entrySource = await entryResponse.text();
+  const appChunk = entrySource.match(/(?:\.\/|\/assets\/)(App-[A-Za-z0-9_-]+\.js)/)?.[1];
+  assert.ok(appChunk, 'The live shop module must exist');
+  const appResponse = await fetch(new URL(`/assets/${appChunk}`, site), { signal: AbortSignal.timeout(20000) });
+  assert.equal(appResponse.status, 200, 'The live shop module must load');
+  const appSource = await appResponse.text();
+  for (const feature of ['Permanently delete', 'delete-record-button', 'View restock', 'Net cash flow change', 'Customer balance after deletion', 'Delete those dependent entries first.']) {
+    assert.ok(appSource.includes(feature), `The live release must include ${feature}`);
+  }
   const screenshot = await send('Page.captureScreenshot', { format: 'png' });
   await writeFile('data/browser/production-sign-in-desktop.png', Buffer.from(screenshot.data, 'base64'));
   await send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
@@ -82,14 +95,18 @@ try {
     const auth = await settings.json();
     const rpc = await fetch(base + '/rest/v1/rpc/videvas_load_workspace', { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(15000) });
     const rpcError = await rpc.json();
+    const deletion = await fetch(base + '/rest/v1/rpc/videvas_save_workspace', { method: 'POST', headers, body: JSON.stringify(${JSON.stringify({ p_state: emptyState(), p_expected_revision: 0, p_request_id: crypto.randomUUID(), p_mode: 'delete' })}), signal: AbortSignal.timeout(15000) });
+    const deletionError = await deletion.json();
     const records = await fetch(base + '/rest/v1/videvas_workspaces?select=owner_id', { headers, signal: AbortSignal.timeout(15000) });
-    return { settings: settings.status, email: auth.external?.email, signupDisabled: auth.disable_signup, rpc: rpc.status, rpcCode: rpcError.code, anonymousRecords: records.status };
+    return { settings: settings.status, email: auth.external?.email, signupDisabled: auth.disable_signup, rpc: rpc.status, rpcCode: rpcError.code, deletion: deletion.status, deletionCode: deletionError.code, anonymousRecords: records.status };
   })()`);
   assert.equal(preflight.settings, 200, 'Supabase must accept the public key');
   assert.equal(preflight.email, true, 'Email sign-in must be enabled');
   assert.notEqual(preflight.signupDisabled, true);
   assert.equal(preflight.rpcCode, '42501', 'Installed RPC must reject anonymous callers');
   assert.ok([401, 403].includes(preflight.rpc));
+  assert.equal(preflight.deletionCode, '42501', 'The installed save RPC must reject anonymous deletion');
+  assert.ok([401, 403].includes(preflight.deletion));
   assert.ok([401, 403].includes(preflight.anonymousRecords));
-  console.log('Production verified: new desktop/mobile sign-in screen, intended public key and project, working email auth settings, installed RPC, anonymous shop access denied.');
+  console.log('Production verified: desktop/mobile sign-in, live sale/payment/restock delete feature, intended Supabase project and key, working auth settings, anonymous reads and deletion denied.');
 } finally { chrome.kill(); for (const task of pending.values()) clearTimeout(task.timer); }

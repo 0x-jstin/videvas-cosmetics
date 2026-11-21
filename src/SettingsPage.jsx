@@ -5,7 +5,7 @@ import { validateState } from './model.js';
 import { activateDemo, hasWorkspaceRecords } from './workspace.js';
 import { useAsyncAction } from './useAsyncAction.js';
 
-export function ConfirmAction({ description, action, onConfirm, onClose, danger, requireText, blocked = false }) {
+export function ConfirmAction({ description, action, onConfirm, onClose, danger, requireText, blocked = false, children }) {
   const [text, setText] = useState('');
   const { error, busy, run } = useAsyncAction();
   const submit = event => {
@@ -18,10 +18,11 @@ export function ConfirmAction({ description, action, onConfirm, onClose, danger,
   };
   return <form onSubmit={submit} aria-busy={busy}><fieldset className="form-fields" disabled={busy || blocked}>
     <div className="modal-body"><div className={`confirmation-icon ${danger ? 'danger' : ''}`}>{danger ? <Trash2 size={25} /> : <RotateCcw size={25} />}</div><p className="confirmation-copy">{description}</p>
+      {children}
       {requireText && <Field label={`Type ${requireText} to confirm`}><input value={text} onChange={event => setText(event.target.value)} autoComplete="off" /></Field>}
       {error && <p className="form-error" role="alert">{error}</p>}
     </div></fieldset>
-    <div className="modal-footer"><button className="button secondary" type="button" onClick={onClose} disabled={busy}>Cancel</button><button className={`button ${danger ? 'danger' : 'primary'}`} disabled={busy || blocked || (requireText && text !== requireText)}>{busy ? 'Saving…' : action}</button></div>
+    <div className="modal-footer"><button className="button secondary" type="button" onClick={onClose} disabled={busy}>Cancel</button><button type="submit" className={`button ${danger ? 'danger' : 'primary'}`} disabled={busy || blocked || (requireText && text !== requireText)}>{busy ? 'Saving…' : action}</button></div>
   </form>;
 }
 
