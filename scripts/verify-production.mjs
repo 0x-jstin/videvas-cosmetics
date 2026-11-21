@@ -79,8 +79,10 @@ try {
   const appResponse = await fetch(new URL(`/assets/${appChunk}`, site), { signal: AbortSignal.timeout(20000) });
   assert.equal(appResponse.status, 200, 'The live shop module must load');
   const appSource = await appResponse.text();
+  // The entry bundle contains the financial model shared with cloud sync.
+  const releaseSource = entrySource + '\n' + appSource;
   for (const feature of ['Permanently delete', 'delete-record-button', 'View restock', 'Net cash flow change', 'Customer balance after deletion', 'Delete those dependent entries first.']) {
-    assert.ok(appSource.includes(feature), `The live release must include ${feature}`);
+    assert.ok(releaseSource.includes(feature), `The live release must include ${feature}`);
   }
   const screenshot = await send('Page.captureScreenshot', { format: 'png' });
   await writeFile('data/browser/production-sign-in-desktop.png', Buffer.from(screenshot.data, 'base64'));
